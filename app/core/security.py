@@ -30,11 +30,14 @@ def burn_password_check(password: str) -> None:
 
 
 # ---- access token (JWT, short-lived, sent in the Authorization header) ----
-def create_access_token(user_id) -> str:
+def create_access_token(user_id, extra_claims: dict | None = None) -> str:
     now = datetime.now(timezone.utc)
     payload = {
+        **(extra_claims or {}),          # email, name, roles - display only, never trusted for auth
+        # Security-critical claims come last so extra_claims can never override them.
         "sub": str(user_id),
         "type": "access",
+        "iss": settings.jwt_issuer,
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_minutes),
     }
@@ -42,7 +45,13 @@ def create_access_token(user_id) -> str:
 
 
 def decode_access_token(token: str) -> dict:
-    payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+    payload = jwt.decode(
+        token,
+        settings.jwt_secret,
+        algorithms=["HS256"],
+        issuer=settings.jwt_issuer,
+        options={"require": ["exp", "iat", "sub", "iss"]},
+    )
     if payload.get("type") != "access":
         raise jwt.InvalidTokenError("wrong token type")
     return payload
