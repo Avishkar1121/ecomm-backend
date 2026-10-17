@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     refresh_token_days_session: int = 1     # not ticked (browser-session cookie)
 
     cookie_secure: bool = False             # must be True in prod (HTTPS)
-    cors_origins: list[str] = ["http://localhost:4200"]
-    frontend_url: str = "http://localhost:4200"
+    cors_origins: list[str] = ["http://localhost:4200", "http://127.0.0.1:4200", "http://localhost:1209", "http://127.0.0.1:1209"]
+    frontend_url: str = "http://localhost:1209"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
