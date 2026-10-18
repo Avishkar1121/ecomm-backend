@@ -18,7 +18,13 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:1209"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
+    smtp_host: str = ""            # empty = dev mode (code is only logged)
+    smtp_port: int = 587           # 587 = STARTTLS, 465 = SSL
+    smtp_user: str = ""
+    smtp_password: str = ""
+    mail_from: str = ""            # e.g. "MarketHub <you@gmail.com>"
+    app_name: str = "MarketHub"
+    
     @field_validator("jwt_secret")
     @classmethod
     def _secret_long_enough(cls, v: str) -> str:

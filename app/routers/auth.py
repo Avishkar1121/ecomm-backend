@@ -1,6 +1,8 @@
+import hmac
 import ipaddress
 import logging
-from typing import Annotated
+import secrets
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
@@ -23,9 +25,14 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 COOKIE_NAME = "refresh_token"
 COOKIE_PATH = "/api/v1/auth"          # browser only sends the cookie to auth endpoints
 REUSE_GRACE_SECONDS = 10              # tolerate two tabs refreshing at the same moment
+OTP_LENGTH = 6
+OTP_TTL_MINUTES = 10
+OTP_RESEND_COOLDOWN_SECONDS = 60
+OTP_MAX_SENDS_PER_HOUR = 5
+OTP_MAX_ATTEMPTS = 5
 
 LowerEmail = Annotated[EmailStr, AfterValidator(lambda e: e.strip().lower())]
-
+Channel = Literal["email", "phone"]
 
 # ------------------------------------------------------------------ schemas
 class RegisterIn(BaseModel):
@@ -99,6 +106,14 @@ class ValidationErrorResponse(BaseModel):
     message: str = "Validation failed."
     errors: dict[str, str]
 
+
+class OtpSendIn(BaseModel):
+    channel: Channel
+
+
+class OtpVerifyIn(BaseModel):
+    channel: Channel
+    code: str = Field(pattern=rf"^[0-9]{{{OTP_LENGTH}}}$")
 
 _VALIDATION = {"model": ValidationErrorResponse, "description": "Validation failed"}
 _UNAUTHORIZED = {"model": ErrorResponse, "description": "Unauthorized"}
@@ -194,6 +209,19 @@ def _authenticate(db: Session, email: str, password: str):
     db.execute(text("UPDATE users SET last_login_at = now() WHERE id = :id"), {"id": user["id"]})
     return user["id"]
 
+def _otp_type(channel: str) -> str:
+    return f"otp_{channel}"                      # 'otp_email' | 'otp_phone'
+
+def _otp_hash(user_id, channel: str, code: str) -> str:
+    # bound to user + channel so a code is useless anywhere else
+    return hash_token(f"{user_id}:{channel}:{code}")
+
+def _deliver_otp(channel: str, destination: str, code: str) -> None:
+    # DEV ONLY: no email/SMS provider yet. Replace with your SES / Twilio / MSG91 call.
+    log.warning("OTP for %s %s: %s", channel, destination, code)
+
+
+
 
 # ------------------------------------------------------------------ endpoints
 @router.post("/register", status_code=201, response_model=TokenResponse,
@@ -236,6 +264,98 @@ def login(body: LoginIn, request: Request, response: Response, db: Session = Dep
     db.commit()
     _set_refresh_cookie(response, raw, body.remember_me)
     return _ok("Login successful.", _token_data(user_id, claims, refresh=raw))
+
+# ------------------------------------------------------------------ otp endpoints
+@router.post("/otp/send", response_model=MessageResponse,
+             responses={400: _VALIDATION, 401: _UNAUTHORIZED,
+                        409: {"model": ErrorResponse, "description": "Already verified"},
+                        429: {"model": ErrorResponse, "description": "Too many requests"}})
+def send_otp(body: OtpSendIn, user: dict = Depends(get_current_user),
+             db: Session = Depends(get_db)):
+    """Send a one-time code to the logged-in user's own email or phone."""
+    user_id = user["id"]
+    row = db.execute(text("""
+        SELECT email, phone, email_verified_at, phone_verified_at
+          FROM users WHERE id = :u AND deleted_at IS NULL AND is_active
+    """), {"u": user_id}).mappings().first()
+    if not row:
+        raise api_error(401, "UNAUTHORIZED", "Not authenticated.")
+
+    destination = row[body.channel]
+    if not destination:
+        raise api_error(400, "NO_DESTINATION", f"No {body.channel} on this account.")
+    if row[f"{body.channel}_verified_at"]:
+        raise api_error(409, "ALREADY_VERIFIED", f"Your {body.channel} is already verified.")
+
+    otp_type = _otp_type(body.channel)
+    stats = db.execute(text("""
+        SELECT count(*) FILTER (WHERE created_at > now() - interval '1 hour') AS last_hour,
+               max(created_at) AS last_sent,
+               EXTRACT(EPOCH FROM now() - max(created_at)) AS since_last
+          FROM auth_tokens WHERE user_id = :u AND type = :t
+    """), {"u": user_id, "t": otp_type}).mappings().first()
+    if stats["since_last"] is not None and stats["since_last"] < OTP_RESEND_COOLDOWN_SECONDS:
+        raise api_error(429, "OTP_COOLDOWN", "Please wait a minute before requesting another code.")
+    if stats["last_hour"] >= OTP_MAX_SENDS_PER_HOUR:
+        raise api_error(429, "OTP_LIMIT", "Too many codes requested. Try again later.")
+
+    # only the newest code is ever valid
+    db.execute(text("""
+        UPDATE auth_tokens SET revoked_at = now()
+         WHERE user_id = :u AND type = :t AND used_at IS NULL AND revoked_at IS NULL
+    """), {"u": user_id, "t": otp_type})
+
+    code = f"{secrets.randbelow(10 ** OTP_LENGTH):0{OTP_LENGTH}d}"
+    db.execute(text("""
+        INSERT INTO auth_tokens (user_id, type, token_hash, expires_at)
+        VALUES (:u, :t, :h, now() + make_interval(mins => :m))
+    """), {"u": user_id, "t": otp_type, "h": _otp_hash(user_id, body.channel, code),
+           "m": OTP_TTL_MINUTES})
+    db.commit()
+
+    _deliver_otp(body.channel, destination, code)
+    return _ok(f"Verification code sent to your {body.channel}.")
+
+@router.post("/otp/verify", response_model=MessageResponse,
+             responses={400: {"model": ErrorResponse, "description": "Invalid or expired code"},
+                        401: _UNAUTHORIZED,
+                        429: {"model": ErrorResponse, "description": "Too many attempts"}})
+def verify_otp(body: OtpVerifyIn, user: dict = Depends(get_current_user),
+               db: Session = Depends(get_db)):
+    """Check the code and mark the email/phone as verified."""
+    user_id = user["id"]
+    otp_type = _otp_type(body.channel)
+
+    # lock the active code so parallel guesses cannot dodge the attempt counter
+    tok = db.execute(text("""
+        SELECT id, token_hash, attempts FROM auth_tokens
+         WHERE user_id = :u AND type = :t
+           AND used_at IS NULL AND revoked_at IS NULL AND expires_at > now()
+         ORDER BY created_at DESC LIMIT 1
+           FOR UPDATE
+    """), {"u": user_id, "t": otp_type}).mappings().first()
+    if not tok:
+        db.commit()
+        raise api_error(400, "INVALID_OTP", "Invalid or expired code.")
+
+    if tok["attempts"] >= OTP_MAX_ATTEMPTS:
+        db.execute(text("UPDATE auth_tokens SET revoked_at = now() WHERE id = :i"),
+                   {"i": tok["id"]})
+        db.commit()
+        raise api_error(429, "OTP_ATTEMPTS", "Too many wrong attempts. Request a new code.")
+
+    if not hmac.compare_digest(tok["token_hash"], _otp_hash(user_id, body.channel, body.code)):
+        db.execute(text("UPDATE auth_tokens SET attempts = attempts + 1 WHERE id = :i"),
+                   {"i": tok["id"]})
+        db.commit()
+        raise api_error(400, "INVALID_OTP", "Invalid or expired code.")
+
+    db.execute(text("UPDATE auth_tokens SET used_at = now() WHERE id = :i"), {"i": tok["id"]})
+    # column names come from a Literal-validated value, never from raw input
+    db.execute(text(f"UPDATE users SET {body.channel}_verified_at = now() WHERE id = :u"),
+               {"u": user_id})
+    db.commit()
+    return _ok(f"Your {body.channel} has been verified.")
 
 
 @router.post("/token", include_in_schema=True)
