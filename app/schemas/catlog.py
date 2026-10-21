@@ -1,100 +1,53 @@
-from datetime import datetime
-from typing import Generic, TypeVar
+from __future__ import annotations
+
 from uuid import UUID
 
-from pydantic import BaseModel
-
-T = TypeVar("T")
+from pydantic import BaseModel, Field
 
 
-class Page(BaseModel, Generic[T]):
-    items: list[T]
-    total: int
-    page: int
-    page_size: int
+class CategoryCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    slug: str = Field(..., min_length=1, max_length=120)
+    parent_id: UUID | None = None
+    sort_order: int = 0
+    is_active: bool = True
 
 
-class CategoryOut(BaseModel):
-    id: UUID
-    parent_id: UUID | None
-    name: str
-    slug: str
+class CategoryUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    slug: str | None = Field(default=None, min_length=1, max_length=120)
+    parent_id: UUID | None = None
+    sort_order: int | None = None
+    is_active: bool | None = None
 
 
-class BrandOut(BaseModel):
-    id: UUID
-    name: str
-    slug: str
-    logo_url: str | None
+class BrandCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    slug: str = Field(..., min_length=1, max_length=120)
+    logo_url: str | None = None
 
 
-class ProductCard(BaseModel):
-    id: UUID
-    slug: str
-    title: str
-    category: str
-    category_slug: str
-    brand: str | None
-    image_url: str | None
-    price: float
-    mrp: float
-    discount_percent: int
-    avg_rating: float
-    review_count: int
-    in_stock: bool
+class BrandUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    slug: str | None = Field(default=None, min_length=1, max_length=120)
+    logo_url: str | None = None
 
 
-class ImageOut(BaseModel):
-    url: str
-    alt_text: str | None
-    is_primary: bool
+class ProductCreate(BaseModel):
+    seller_id: UUID
+    category_id: UUID
+    brand_id: UUID | None = None
+    title: str = Field(..., min_length=1, max_length=250)
+    slug: str = Field(..., min_length=1, max_length=280)
+    description: str | None = None
+    status: str = "draft"
 
 
-class VariantOut(BaseModel):
-    id: UUID
-    sku: str
-    name: str | None
-    price: float
-    mrp: float
-    stock_qty: int
-    in_stock: bool
-
-
-class RatingBreakdown(BaseModel):
-    total_reviews: int = 0
-    avg_rating: float = 0
-    five_star: int = 0
-    four_star: int = 0
-    three_star: int = 0
-    two_star: int = 0
-    one_star: int = 0
-
-
-class ProductDetail(BaseModel):
-    id: UUID
-    slug: str
-    title: str
-    description: str | None
-    category: str
-    category_slug: str
-    brand: str | None
-    seller_store: str
-    seller_slug: str
-    features: list[str]
-    specs: dict
-    images: list[ImageOut]
-    variants: list[VariantOut]
-    price: float
-    mrp: float
-    discount_percent: int
-    in_stock: bool
-    rating: RatingBreakdown
-
-
-class ReviewOut(BaseModel):
-    id: UUID
-    rating: int
-    title: str | None
-    body: str | None
-    reviewer: str
-    created_at: datetime
+class ProductUpdate(BaseModel):
+    seller_id: UUID | None = None
+    category_id: UUID | None = None
+    brand_id: UUID | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=250)
+    slug: str | None = Field(default=None, min_length=1, max_length=280)
+    description: str | None = None
+    status: str | None = None
