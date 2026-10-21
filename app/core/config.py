@@ -6,6 +6,9 @@ class Settings(BaseSettings):
     database_url: str
     jwt_secret: str
     jwt_issuer: str = "markethub"
+    
+    otp_pepper: str                 # required: app refuses to start without it
+    otp_dev_log: bool = False       # local only: print OTPs in the server log
 
     env: str = "dev"                        # "dev" | "prod"
 

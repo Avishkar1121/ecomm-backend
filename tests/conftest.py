@@ -13,7 +13,7 @@ Env overrides (all optional):
     APP_PACKAGE         name of the package that contains main.py (default: app)
 
 Schema source, in this order: TEST_SCHEMA_SQL -> db/ecomm.sql + db/002_buyer_additions.sql
-+ db/003_catalog_support.sql -> migrations/*.sql (sorted) -> `alembic upgrade head`.
++ db/003_catlog_support.sql -> migrations/*.sql (sorted) -> `alembic upgrade head`.
 
 WARNING: the test database is DROPPED AND RECREATED every run. The URL must contain "test".
 """
@@ -29,8 +29,8 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 TEST_DB_URL = os.environ.get(
-    "TEST_DATABASE_URL",
-    "postgresql+psycopg2://postgres:postgres@localhost:5433/markethub_test",
+    "TEST_DB_URL",
+    "postgresql+psycopg2://postgres:postgres@localhost:5434/markethub_test",
 )
 APP_PACKAGE = os.environ.get("APP_PACKAGE", "app")
 API = "/api/v1"
@@ -73,7 +73,7 @@ def _run_sql_file(engine, path: Path) -> None:
 
 # The project's own schema files, applied in this order. dev_seed.sql is deliberately NOT here:
 # it is sample data, and tests create the rows they need.
-PROJECT_SCHEMA_FILES = ["db/ecomm.sql", "db/002_buyer_additions.sql", "db/003_catalog_support.sql"]
+PROJECT_SCHEMA_FILES = ["db/ecomm.sql", "db/002_buyer_additions.sql", "db/003_catlog_support.sql"]
 
 
 def _project_schema_files() -> list[Path] | None:

@@ -1,5 +1,5 @@
 -- =====================================================================
--- MarketHub - migration 003: catalog support
+-- MarketHub - migration 003: catlog support
 -- Keeps products.avg_rating / review_count in sync with reviews (automatic),
 -- and adds a trigram index so search by title is fast.
 -- Run after 002. Safe to run twice.
@@ -36,5 +36,5 @@ UPDATE products p
    SET avg_rating   = COALESCE((SELECT round(avg(rating)::numeric, 2) FROM reviews WHERE product_id = p.id), 0),
        review_count = (SELECT count(*) FROM reviews WHERE product_id = p.id);
 
-INSERT INTO schema_migrations (version) VALUES ('003_catalog_support') ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations (version) VALUES ('003_catlog_support') ON CONFLICT DO NOTHING;
 COMMIT;

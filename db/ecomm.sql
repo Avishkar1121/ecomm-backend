@@ -115,7 +115,7 @@ CREATE TRIGGER trg_seller_profiles_updated BEFORE UPDATE ON seller_profiles
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------
--- 3. CATALOG (5 tables)
+-- 3. catlog (5 tables)
 -- ---------------------------------------------------------------------
 CREATE TABLE categories (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -209,7 +209,7 @@ CREATE TABLE cart_items (
 -- ---------------------------------------------------------------------
 -- 5. ORDERS (3 tables)
 -- Orders are SNAPSHOTS: copy name, price and address at purchase time so
--- later catalog or address edits never change history.
+-- later catlog or address edits never change history.
 -- ---------------------------------------------------------------------
 CREATE TABLE orders (
   id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
