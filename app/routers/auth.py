@@ -17,6 +17,8 @@ from sqlalchemy.orm import Session
 from ..core.config import settings
 from ..core.errors import api_error
 from ..core.database import get_db
+from ..core.mailer import send_email
+from ..core.rate_limit import client_key, limiter
 from ..deps import fetch_user, get_current_user, get_otp_user
 from ..core.security import (VERIFY_TOKEN_MINUTES, burn_password_check, create_access_token,
                              create_verify_token, hash_password, hash_token, new_opaque_token,
@@ -35,6 +37,14 @@ OTP_MAX_SENDS_PER_HOUR = 5            # per user, per channel
 OTP_MAX_SENDS_PER_IP_HOUR = 20        # per IP, all channels (SMS-pumping guard)
 OTP_MAX_ATTEMPTS = 5
 DEFAULT_PHONE_REGION = "IN"
+
+# Rate limits (in-memory, per process; see core/rate_limit.py)
+LOGIN_MAX_PER_IP = (30, 600)             # 30 attempts / 10 min per IP
+LOGIN_MAX_PER_IP_EMAIL = (8, 900)        # 8 attempts / 15 min per IP+email pair
+REGISTER_MAX_PER_IP = (10, 3600)
+FORGOT_MAX_PER_IP = (5, 3600)
+FORGOT_MAX_PER_EMAIL = (3, 3600)
+RESET_MAX_PER_IP = (10, 3600)
 
 
 def _normalize_phone(value: str | None) -> str | None:
@@ -92,7 +102,6 @@ class TokenData(BaseModel):
     accessToken: str
     tokenType: str = "bearer"
     expiresIn: int
-    refreshToken: str | None = None
 
 
 class AccessData(BaseModel):
@@ -174,13 +183,11 @@ def _fail(status_code: int, message: str, code: str) -> JSONResponse:
                         status_code=status_code)
 
 
-def _token_data(user_id, claims: dict | None = None, refresh: str | None = None) -> dict:
-    data = {"accessToken": create_access_token(user_id, claims or {}),
+def _token_data(user_id, claims: dict | None = None) -> dict:
+    """The refresh token is NEVER put in the body: it lives only in the httpOnly cookie."""
+    return {"accessToken": create_access_token(user_id, claims or {}),
             "tokenType": "bearer",
             "expiresIn": settings.access_token_minutes * 60}
-    if refresh:
-        data["refreshToken"] = refresh
-    return data
 
 
 def _verify_token_data(user_id, claims: dict) -> dict:
@@ -246,13 +253,15 @@ def _set_refresh_cookie(response: Response, raw: str, remember: bool) -> None:
     days = settings.refresh_token_days_remember
     response.set_cookie(
         COOKIE_NAME, raw, httponly=True, secure=settings.cookie_secure,
-        samesite="lax", path=COOKIE_PATH,
+        samesite=settings.cookie_samesite, path=COOKIE_PATH,
         max_age=days * 86400 if remember else None,   # None = deleted when the browser closes
     )
 
 
 def _clear_refresh_cookie(response: Response) -> None:
-    response.delete_cookie(COOKIE_NAME, path=COOKIE_PATH)
+    # attributes must match set_cookie, otherwise SameSite=None cookies are not removed
+    response.delete_cookie(COOKIE_NAME, path=COOKIE_PATH, httponly=True,
+                           secure=settings.cookie_secure, samesite=settings.cookie_samesite)
 
 
 def _session_expired() -> JSONResponse:
@@ -260,6 +269,13 @@ def _session_expired() -> JSONResponse:
     resp = _fail(401, "Session expired.", "SESSION_EXPIRED")
     _clear_refresh_cookie(resp)
     return resp
+
+
+def _throttle_login(request: Request, email: str) -> None:
+    ip = client_key(request)
+    limiter.check(f"login:ip:{ip}", *LOGIN_MAX_PER_IP)
+    # keyed on IP+email (not email alone) so a stranger cannot lock the real owner out
+    limiter.check(f"login:pair:{ip}:{email}", *LOGIN_MAX_PER_IP_EMAIL)
 
 
 def _authenticate(db: Session, email: str, password: str):
@@ -292,13 +308,19 @@ def _otp_hash(token_id, user_id, channel: str, destination: str, code: str) -> s
 
 def _deliver_otp(channel: str, destination: str, code: str) -> None:
     """Runs in a background task, so a slow provider never blocks the request.
-    Replace the body with your SES / Twilio / MSG91 call. If it fails, the user just resends."""
+    Email goes out over SMTP (core/mailer.py). SMS is still a stub: plug in Twilio / MSG91 here.
+    If delivery fails, the user just resends."""
     try:
-        if getattr(settings, "otp_dev_log", False):
-            # DEV ONLY (set OTP_DEV_LOG=true locally). Must stay off in production.
+        if settings.otp_dev_log:
+            # DEV ONLY (set OTP_DEV_LOG=true locally). Refused at startup when ENV=prod.
             log.warning("OTP for %s %s: %s", channel, destination, code)
             return
-        raise NotImplementedError("No email/SMS provider configured")
+        if channel == "email":
+            send_email(destination, f"Your {settings.app_name} verification code",
+                       f"Your verification code is {code}.\n\n"
+                       f"It expires in {OTP_TTL_MINUTES} minutes. If you did not request it, ignore this email.")
+            return
+        raise NotImplementedError("No SMS provider configured")
     except Exception:
         # never log the code itself here
         log.exception("OTP delivery failed (channel=%s)", channel)
@@ -350,6 +372,7 @@ def require_verified(first: Channel, *rest: Channel):
                         409: {"model": ErrorResponse, "description": "Email or phone already registered"}})
 def register(body: RegisterIn, request: Request, response: Response,
              background: BackgroundTasks, db: Session = Depends(get_db)):
+    limiter.check(f"register:ip:{client_key(request)}", *REGISTER_MAX_PER_IP)
     # Registration ALWAYS creates a buyer. Sellers apply separately and an admin approves.
     parts = body.full_name.strip().split(None, 1)
     first, last = parts[0][:80], (parts[1][:80] if len(parts) > 1 else "")
@@ -385,6 +408,7 @@ def register(body: RegisterIn, request: Request, response: Response,
              responses={400: _VALIDATION, 401: _UNAUTHORIZED,
                         403: {"model": ErrorResponse, "description": "Account not verified yet"}})
 def login(body: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
+    _throttle_login(request, body.email)
     user_id = _authenticate(db, body.email, body.password)
     claims = _claims(db, user_id)
     if not _is_activated(claims):
@@ -393,7 +417,7 @@ def login(body: LoginIn, request: Request, response: Response, db: Session = Dep
     raw = _issue_refresh_token(db, request, user_id, body.remember_me)
     db.commit()
     _set_refresh_cookie(response, raw, body.remember_me)
-    return _ok("Login successful.", _token_data(user_id, claims, refresh=raw))
+    return _ok("Login successful.", _token_data(user_id, claims))
 
 
 # ------------------------------------------------------------------ otp endpoints
@@ -529,16 +553,19 @@ def verify_otp(body: OtpVerifyIn, request: Request, response: Response,
         raw = _issue_refresh_token(db, request, user_id, remember=False)
         db.commit()
         _set_refresh_cookie(response, raw, remember=False)
-        return _ok(message, _token_data(user_id, claims, refresh=raw))
+        return _ok(message, _token_data(user_id, claims))
     # Already logged in (verifying the second channel): just refresh the claims.
     return _ok(message, _token_data(user_id, claims))
 
 
-@router.post("/token", include_in_schema=True)
-def swagger_token(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def swagger_token(request: Request, form: OAuth2PasswordRequestForm = Depends(),
+                  db: Session = Depends(get_db)):
     """Form-based login used only by the Swagger 'Authorize' button (no cookie).
-    Keeps the standard OAuth2 shape on purpose: Swagger requires access_token/token_type."""
-    user_id = _authenticate(db, form.username.strip().lower(), form.password)
+    Keeps the standard OAuth2 shape on purpose: Swagger requires access_token/token_type.
+    Registered ONLY when ENV=dev (see the bottom of this file)."""
+    email = form.username.strip().lower()
+    _throttle_login(request, email)
+    user_id = _authenticate(db, email, form.password)
     claims = _claims(db, user_id)
     db.commit()
     if not _is_activated(claims):
@@ -621,9 +648,26 @@ def me(user: dict = Depends(get_current_user)):
     return _ok("Profile fetched.", user)
 
 
+def _deliver_reset_link(email: str, raw_token: str) -> None:
+    """Background task. Never logs the token unless OTP_DEV_LOG=true (dev only)."""
+    link = f"{settings.frontend_url}/reset-password?token={raw_token}"
+    try:
+        if settings.otp_dev_log:
+            log.warning("PASSWORD RESET LINK for %s: %s", email, link)
+            return
+        send_email(email, f"Reset your {settings.app_name} password",
+                   f"Use this link to choose a new password (valid for 30 minutes):\n\n{link}\n\n"
+                   "If you did not ask for this, ignore this email.")
+    except Exception:
+        log.exception("Password reset email failed")
+
+
 @router.post("/forgot-password", response_model=MessageResponse, responses={400: _VALIDATION})
-def forgot_password(body: ForgotIn, db: Session = Depends(get_db)):
+def forgot_password(body: ForgotIn, request: Request, background: BackgroundTasks,
+                    db: Session = Depends(get_db)):
     """Always answers the same way, so it never reveals which emails are registered."""
+    limiter.check(f"forgot:ip:{client_key(request)}", *FORGOT_MAX_PER_IP)
+    limiter.check(f"forgot:email:{body.email}", *FORGOT_MAX_PER_EMAIL)
     user_id = db.execute(text("""
         SELECT id FROM users WHERE email = :e AND deleted_at IS NULL AND is_active
     """), {"e": body.email}).scalar()
@@ -634,15 +678,14 @@ def forgot_password(body: ForgotIn, db: Session = Depends(get_db)):
             VALUES (:u, 'password_reset', :h, now() + interval '30 minutes')
         """), {"u": user_id, "h": hashed})
         db.commit()
-        # DEV ONLY: no email service yet, so the link is printed in the server log.
-        log.warning("PASSWORD RESET LINK for %s: %s/reset-password?token=%s",
-                    body.email, settings.frontend_url, raw)
+        background.add_task(_deliver_reset_link, body.email, raw)
     return _ok("If that email is registered, a reset link has been sent.")
 
 
 @router.post("/reset-password", response_model=MessageResponse,
              responses={400: {"model": ErrorResponse, "description": "Invalid token or validation failed"}})
-def reset_password(body: ResetIn, db: Session = Depends(get_db)):
+def reset_password(body: ResetIn, request: Request, db: Session = Depends(get_db)):
+    limiter.check(f"reset:ip:{client_key(request)}", *RESET_MAX_PER_IP)
     row = db.execute(text("""
         UPDATE auth_tokens SET used_at = now()
          WHERE token_hash = :h AND type = 'password_reset'
@@ -663,3 +706,8 @@ def reset_password(body: ResetIn, db: Session = Depends(get_db)):
     """), {"u": row["user_id"]})
     db.commit()
     return _ok("Password updated. Please sign in.")
+
+
+# Swagger "Authorize" login. Not exposed outside dev: it skips remember-me and the cookie flow.
+if settings.is_dev:
+    router.add_api_route("/token", swagger_token, methods=["POST"])

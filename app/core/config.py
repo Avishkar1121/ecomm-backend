@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -17,6 +19,7 @@ class Settings(BaseSettings):
     refresh_token_days_session: int = 1     # not ticked (browser-session cookie)
 
     cookie_secure: bool = False             # must be True in prod (HTTPS)
+    cookie_samesite: Literal["lax", "strict", "none"] = "lax"   # "none" only if the SPA and API are on different sites
     cors_origins: list[str] = ["http://localhost:4200", "http://127.0.0.1:4200", "http://localhost:1209", "http://127.0.0.1:1209"]
     frontend_url: str = "http://localhost:1209"
 
@@ -39,6 +42,10 @@ class Settings(BaseSettings):
     def _prod_guards(self):
         if self.env == "prod" and not self.cookie_secure:
             raise ValueError("COOKIE_SECURE must be true when ENV=prod")
+        if self.cookie_samesite == "none" and not self.cookie_secure:
+            raise ValueError("COOKIE_SECURE must be true when COOKIE_SAMESITE=none")
+        if self.env == "prod" and self.otp_dev_log:
+            raise ValueError("OTP_DEV_LOG must be false when ENV=prod (it logs OTPs and reset links)")
         return self
 
     @property

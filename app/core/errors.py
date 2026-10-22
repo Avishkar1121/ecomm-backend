@@ -4,12 +4,17 @@
   validation:  {"success": false, "message": "Validation failed.",
                 "errors": {"email": "Please provide a valid email address."}}
 """
+import logging
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+log = logging.getLogger("markethub.errors")
 
 DEFAULT_CODES = {
     400: "BAD_REQUEST", 401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "NOT_FOUND",
@@ -99,3 +104,19 @@ def register_error_handlers(app: FastAPI) -> None:
             errors.setdefault(field, _field_message(field, err))   # first error per field
         return JSONResponse({"success": False, "message": "Validation failed.", "errors": errors},
                             status_code=400)
+
+    @app.exception_handler(IntegrityError)
+    async def integrity_error(request: Request, exc: IntegrityError):
+        """A database constraint was hit and nobody handled it: answer 4xx instead of a bare 500.
+        (Routes that need a specific message, like register, still catch it themselves.)"""
+        state = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+        if state == "23505":      # unique_violation
+            code, status, message = "DUPLICATE", 409, "A record with the same unique value (e.g. slug, name or SKU) already exists."
+        elif state == "23503":    # foreign_key_violation
+            code, status, message = "REFERENCE_ERROR", 400, "A referenced record does not exist, or this record is still in use."
+        elif state in ("23502", "23514"):   # not_null / check violation
+            code, status, message = "INVALID_DATA", 400, "The data violates a database rule."
+        else:
+            log.exception("Unhandled database integrity error")
+            code, status, message = "INTERNAL_ERROR", 500, "Internal server error."
+        return JSONResponse({"success": False, "message": message, "code": code}, status_code=status)

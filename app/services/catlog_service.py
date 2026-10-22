@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Literal
 from uuid import UUID
 
@@ -8,6 +9,8 @@ from sqlalchemy.orm import Session
 
 from app.repositories.catlog_repo import catlogRepository
 
+
+log = logging.getLogger("markethub.catalog")
 
 SortKey = Literal["newest", "price_asc", "price_desc", "rating", "trending"]
 
@@ -42,8 +45,42 @@ class catlogService:
         rows = catlogRepository.list_brands(db, category=category)
         return [dict(r) for r in rows]
 
+    _LIST_SELECT = """
+        SELECT p.id, p.slug, p.title,
+               c.name AS category, c.slug AS category_slug, b.name AS brand,
+               p.avg_rating, p.review_count,
+               v.price, v.mrp, v.in_stock,
+               img.url AS image_url
+    """
+
+    _LIST_JOINS = """
+          FROM products p
+          JOIN categories c ON c.id = p.category_id
+          JOIN seller_profiles sp ON sp.user_id = p.seller_id
+          LEFT JOIN brands b ON b.id = p.brand_id
+          JOIN LATERAL (
+                SELECT min(pv.price) AS price,
+                       (array_agg(pv.mrp ORDER BY pv.price, pv.id))[1] AS mrp,
+                       bool_or(pv.stock_qty > 0) AS in_stock
+                  FROM product_variants pv
+                 WHERE pv.product_id = p.id
+                   AND pv.is_active = TRUE
+          ) v ON v.price IS NOT NULL
+    """
+
+    _LIST_IMAGE_JOIN = """
+          LEFT JOIN LATERAL (
+                SELECT pi.url
+                  FROM product_images pi
+                 WHERE pi.product_id = p.id
+                   AND pi.is_primary = TRUE
+                 ORDER BY pi.sort_order
+                 LIMIT 1
+          ) img ON true
+    """
+
     @staticmethod
-    def build_listing_query(
+    def build_filters(
         q: str | None,
         category: str | None,
         brand: list[str],
@@ -51,47 +88,23 @@ class catlogService:
         max_price: float | None,
         min_rating: float | None,
         in_stock: bool,
-        sort: SortKey,
-        page: int,
-        page_size: int,
     ) -> tuple[str, dict]:
-        sql = """
-            SELECT p.id, p.slug, p.title,
-                   c.name AS category, c.slug AS category_slug, b.name AS brand,
-                   p.avg_rating, p.review_count,
-                   v.price, v.mrp, v.in_stock,
-                   img.url AS image_url
-              FROM products p
-              JOIN categories c ON c.id = p.category_id
-              LEFT JOIN brands b ON b.id = p.brand_id
-              JOIN LATERAL (
-                    SELECT min(pv.price) AS price,
-                           (array_agg(pv.mrp ORDER BY pv.price, pv.id))[1] AS mrp,
-                           bool_or(pv.stock_qty > 0) AS in_stock
-                      FROM product_variants pv
-                     WHERE pv.product_id = p.id
-                       AND pv.is_active = TRUE
-              ) v ON v.price IS NOT NULL
-              LEFT JOIN LATERAL (
-                    SELECT pi.url
-                      FROM product_images pi
-                     WHERE pi.product_id = p.id
-                       AND pi.is_primary = TRUE
-                     ORDER BY pi.sort_order
-                     LIMIT 1
-              ) img ON true
-             WHERE p.status = 'active'
-               AND p.deleted_at IS NULL
-               AND c.is_active = TRUE
+        """WHERE clause + params shared by the page query AND the count query,
+        so the pagination total can never disagree with the listing."""
+        where = """
+         WHERE p.status = 'active'
+           AND p.deleted_at IS NULL
+           AND c.is_active = TRUE
+           AND sp.verification_status = 'approved'
         """
         params: dict = {}
 
         if q and q.strip():
-            sql += " AND (p.title ILIKE :q OR b.name ILIKE :q)"
+            where += " AND (p.title ILIKE :q OR b.name ILIKE :q)"
             params["q"] = catlogService._like(q.strip())
 
         if category:
-            sql += """
+            where += """
                 AND (
                     c.slug = :category
                     OR c.parent_id = (
@@ -102,28 +115,25 @@ class catlogService:
             params["category"] = category
 
         if brand:
-            sql += " AND b.slug IN :brand_slugs"
+            where += " AND b.slug IN :brand_slugs"
             params["brand_slugs"] = brand
 
         if min_price is not None:
-            sql += " AND v.price >= :min_price"
+            where += " AND v.price >= :min_price"
             params["min_price"] = min_price
 
         if max_price is not None:
-            sql += " AND v.price <= :max_price"
+            where += " AND v.price <= :max_price"
             params["max_price"] = max_price
 
         if min_rating is not None:
-            sql += " AND p.avg_rating >= :min_rating"
+            where += " AND p.avg_rating >= :min_rating"
             params["min_rating"] = min_rating
 
         if in_stock:
-            sql += " AND v.in_stock = TRUE"
+            where += " AND v.in_stock = TRUE"
 
-        sql += f" ORDER BY {catlogService._SORTS[sort]}, p.id LIMIT :limit OFFSET :offset"
-        params.update({"limit": page_size, "offset": (page - 1) * page_size})
-
-        return sql, params
+        return where, params
 
     @staticmethod
     def list_products(
@@ -139,28 +149,19 @@ class catlogService:
         page: int,
         page_size: int,
     ):
-        sql, params = catlogService.build_listing_query(
-            q=q,
-            category=category,
-            brand=brand,
-            min_price=min_price,
-            max_price=max_price,
-            min_rating=min_rating,
-            in_stock=in_stock,
-            sort=sort,
-            page=page,
-            page_size=page_size,
+        where, params = catlogService.build_filters(
+            q, category, brand, min_price, max_price, min_rating, in_stock
         )
+        sql = (
+            catlogService._LIST_SELECT + catlogService._LIST_JOINS
+            + catlogService._LIST_IMAGE_JOIN + where
+            + f" ORDER BY {catlogService._SORTS[sort]} LIMIT :limit OFFSET :offset"
+        )
+        count_sql = "SELECT COUNT(*) " + catlogService._LIST_JOINS + where
+        page_params = {**params, "limit": page_size, "offset": (page - 1) * page_size}
 
-        # Reuse the exact FROM/JOIN/WHERE section for count to keep all filters,
-        # including the minimum active-variant price, consistent.
-        from_index = sql.index(" FROM products p")
-        order_index = sql.rfind(" ORDER BY ")
-        count_sql = "SELECT COUNT(*)" + sql[from_index:order_index]
-        total_params = {k: v for k, v in params.items() if k not in {"limit", "offset"}}
-
-        rows = catlogRepository.list_products(db, sql, params)
-        total = catlogRepository.count_products(db, count_sql, total_params) or 0
+        rows = catlogRepository.list_products(db, sql, page_params)
+        total = catlogRepository.count_products(db, count_sql, params) or 0
 
         items = []
         for row in rows:
@@ -206,7 +207,9 @@ class catlogService:
             price = float(v["price"])
             mrp = float(v["mrp"])
             if mrp < price:
-                raise HTTPException(status_code=500, detail=f"Invalid variant pricing for product {row['id']}")
+                # bad catalogue data must not take the page down: show no discount and log it
+                log.warning("Variant %s of product %s has mrp %s below price %s", v["id"], row["id"], mrp, price)
+                mrp = price
             variant_out.append({
                 "id": v["id"],
                 "sku": v["sku"],

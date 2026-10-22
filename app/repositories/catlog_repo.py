@@ -6,6 +6,23 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 
+_APPROVED_SELLER = "sp.verification_status = 'approved'"
+_PRODUCT_EXTRA_COLUMNS: set[str] | None = None
+
+
+def _product_extra_columns(db: Session) -> set[str]:
+    """Which of products.features / products.specs actually exist (checked once per process)."""
+    global _PRODUCT_EXTRA_COLUMNS
+    if _PRODUCT_EXTRA_COLUMNS is None:
+        rows = db.execute(text("""
+            SELECT column_name FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'products'
+               AND column_name IN ('features', 'specs')
+        """)).scalars().all()
+        _PRODUCT_EXTRA_COLUMNS = set(rows)
+    return _PRODUCT_EXTRA_COLUMNS
+
+
 class catlogRepository:
     @staticmethod
     def _execute(db: Session, sql: str, params: dict | None = None):
@@ -33,9 +50,11 @@ class catlogRepository:
             FROM public.brands b
             JOIN public.products p ON p.brand_id = b.id
             JOIN public.categories c ON c.id = p.category_id
+            JOIN public.seller_profiles sp ON sp.user_id = p.seller_id
             WHERE p.status = 'active'
               AND p.deleted_at IS NULL
               AND c.is_active = TRUE
+              AND sp.verification_status = 'approved'
               AND EXISTS (
                   SELECT 1
                   FROM public.product_variants pv
@@ -75,14 +94,17 @@ class catlogRepository:
 
     @staticmethod
     def get_product_row(db: Session, slug: str):
-        return db.execute(text("""
+        extra = _product_extra_columns(db)
+        features = "p.features" if "features" in extra else "NULL::text[] AS features"
+        specs = "p.specs" if "specs" in extra else "NULL::jsonb AS specs"
+        return db.execute(text(f"""
             SELECT
                 p.id,
                 p.slug,
                 p.title,
                 p.description,
-                p.features,
-                p.specs,
+                {features},
+                {specs},
                 p.category_id,
                 c.name AS category,
                 c.slug AS category_slug,
@@ -99,7 +121,10 @@ class catlogRepository:
             WHERE p.slug = :slug
             AND p.status = 'active'
             AND p.deleted_at IS NULL
+            AND c.is_active = TRUE
+            AND {_APPROVED_SELLER}
         """), {"slug": slug}).mappings().first()
+
     @staticmethod
     def get_product_images(db: Session, product_id: UUID):
         return db.execute(text("""
@@ -183,6 +208,7 @@ class catlogRepository:
                    img.url AS image_url
               FROM products p
               JOIN categories c ON c.id = p.category_id
+              JOIN seller_profiles sp ON sp.user_id = p.seller_id
               LEFT JOIN brands b ON b.id = p.brand_id
               JOIN LATERAL (
                   SELECT min(pv.price) AS price,
@@ -202,6 +228,8 @@ class catlogRepository:
               ) img ON true
              WHERE p.status = 'active'
                AND p.deleted_at IS NULL
+               AND c.is_active = TRUE
+               AND sp.verification_status = 'approved'
                AND p.category_id = :category_id
                AND p.id <> :product_id
              ORDER BY p.review_count DESC, p.avg_rating DESC, p.id
