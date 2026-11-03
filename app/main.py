@@ -15,9 +15,9 @@ from .routers import auth, catlog, cart, wishlist, orders, seller, admin
 app = FastAPI(
     title="MarketHub API",
     version="0.2.0",
-    docs_url="/docs" if settings.is_dev else None,
-    redoc_url="/redoc" if settings.is_dev else None,
-    openapi_url="/openapi.json" if settings.is_dev else None,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
 
 register_error_handlers(app)
@@ -49,9 +49,9 @@ def admin_ping(user: dict = Depends(require_role("admin"))):
 app.include_router(api)
 
 
-@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+@app.get("/", include_in_schema=False)
 def root():
-    return {"status": "ok"}
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/health", tags=["system"])
