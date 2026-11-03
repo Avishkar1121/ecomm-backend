@@ -10,8 +10,8 @@ from .core.config import settings
 from .core.errors import register_error_handlers
 from .core.database import get_db
 from .deps import require_role
-from .routers import auth, catlog ,cart, wishlist, orders
-
+from .routers import auth, catlog ,cart, wishlist, orders,seller
+from .routers import auth, catlog, cart, wishlist, orders, seller, admin
 app = FastAPI(title="MarketHub API", version="0.2.0",
               docs_url="/docs" if settings.is_dev else None,
               redoc_url="/redoc" if settings.is_dev else None,
@@ -34,7 +34,8 @@ api.include_router(catlog.router)
 api.include_router(cart.router)
 api.include_router(wishlist.router)
 api.include_router(orders.router)
-
+api.include_router(seller.router)
+api.include_router(admin.router)
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs" if settings.is_dev else "/health")

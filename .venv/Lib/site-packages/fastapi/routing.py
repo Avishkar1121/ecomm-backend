@@ -5,6 +5,7 @@ import errno
 import functools
 import inspect
 import json
+import math
 import os
 import stat
 import threading
@@ -99,7 +100,7 @@ from starlette import routing
 from starlette._exception_handler import wrap_app_handling_exceptions
 from starlette._utils import get_route_path, is_async_callable
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
-from starlette.datastructures import URL, FormData, URLPath
+from starlette.datastructures import URL, URLPath
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import (
@@ -305,6 +306,17 @@ def _extract_endpoint_context(func: Any) -> EndpointContext:
     return ctx
 
 
+def _normalize_non_finite_floats(data: Any) -> Any:
+    """Replace non-finite values in JSON-compatible data, preserving dict keys."""
+    if isinstance(data, float):
+        return data if math.isfinite(data) else None
+    if isinstance(data, dict):
+        return {key: _normalize_non_finite_floats(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [_normalize_non_finite_floats(value) for value in data]
+    return data
+
+
 async def serialize_response(
     *,
     field: ModelField | None = None,
@@ -437,7 +449,7 @@ def get_request_handler(
 
         # Read body and auto-close files
         try:
-            body: Any = None
+            body: Any = Undefined
             if body_field:
                 if is_body_form:
                     body = await request.form()
@@ -457,7 +469,7 @@ def get_request_handler(
                                 subtype = message.get_content_subtype()
                                 if subtype == "json" or subtype.endswith("+json"):
                                     json_body = await request.json()
-                        if json_body != Undefined:
+                        if json_body is not Undefined:
                             body = json_body
                         else:
                             body = body_bytes
@@ -487,7 +499,7 @@ def get_request_handler(
             raise http_error from e
 
         if telemetry_data is not None:
-            telemetry_data.body = body
+            telemetry_data.body = None if body is Undefined else body
 
         # Solve dependencies and run path operation function, auto-closing dependencies
         errors: list[Any] = []
@@ -499,7 +511,7 @@ def get_request_handler(
             solved_result = await solve_dependencies(
                 request=request,
                 dependant=dependant,
-                body=cast(dict[str, Any] | FormData | bytes | None, body),
+                body=body,
                 dependency_overrides_provider=dependency_overrides_provider,
                 async_exit_stack=async_exit_stack,
                 embed_body_fields=embed_body_fields,
@@ -536,7 +548,9 @@ def get_request_handler(
                     )
                 else:
                     data = jsonable_encoder(data)
-                    return json.dumps(data).encode("utf-8")
+                    return json.dumps(_normalize_non_finite_floats(data)).encode(
+                        "utf-8"
+                    )
 
             if is_sse_stream:
                 # Generator endpoint: stream as Server-Sent Events
@@ -554,7 +568,11 @@ def get_request_handler(
                             if hasattr(item.data, "model_dump_json"):
                                 data_str = item.data.model_dump_json()
                             else:
-                                data_str = json.dumps(jsonable_encoder(item.data))
+                                data_str = json.dumps(
+                                    _normalize_non_finite_floats(
+                                        jsonable_encoder(item.data)
+                                    )
+                                )
                         else:
                             data_str = None
                         return format_sse_event(
@@ -772,7 +790,9 @@ def get_request_handler(
                     response.headers.raw.extend(solved_result.response.headers.raw)
         if errors:
             validation_error = RequestValidationError(
-                errors, body=body, endpoint_ctx=endpoint_ctx
+                errors,
+                body=None if body is Undefined else body,
+                endpoint_ctx=endpoint_ctx,
             )
             _validation_failed(validation_error)
             raise validation_error
@@ -1592,6 +1612,8 @@ class RouteContext:
     @property
     def _effective_route(self) -> BaseRoute | _EffectiveRouteContext:
         if self._route_context is not None:
+            if self._route_context.starlette_route is not None:
+                return self._route_context.starlette_route
             return self._route_context
         return self.route
 
@@ -2002,13 +2024,16 @@ class _FrontendStaticFiles(StaticFiles):
             return self.file_response(full_path, stat_result, scope)
 
         if self.fallback == "404.html" or (
-            self.fallback == "auto" and self._fallback_file_exists("404.html")
+            self.fallback == "auto" and await self._fallback_file_exists("404.html")
         ):
             return await self._fallback_response("404.html", scope, status_code=404)
 
         if (
             self.fallback == "index.html"
-            or (self.fallback == "auto" and self._fallback_file_exists("index.html"))
+            or (
+                self.fallback == "auto"
+                and await self._fallback_file_exists("index.html")
+            )
         ) and _is_frontend_navigation_request(scope):
             return await self._fallback_response("index.html", scope, status_code=200)
 
@@ -2041,8 +2066,8 @@ class _FrontendStaticFiles(StaticFiles):
                 return full_path, stat_result, True
         return None
 
-    def _fallback_file_exists(self, fallback: str) -> bool:
-        _, stat_result = self.lookup_path(fallback)
+    async def _fallback_file_exists(self, fallback: str) -> bool:
+        _, stat_result = await run_in_threadpool(self.lookup_path, fallback)
         return stat_result is not None and stat.S_ISREG(stat_result.st_mode)
 
     async def _fallback_response(

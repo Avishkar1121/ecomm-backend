@@ -83,10 +83,8 @@ def _connect(conninfo: str) -> PQGenConn[PGconn]:
 
         if status == POLL_READING or status == POLL_WRITING:
             wait = WAIT_R if status == POLL_READING else WAIT_W
-            while True:
-                ready = yield conn.socket, wait
-                if ready:
-                    break
+            while not (yield conn.socket, wait):
+                pass
 
         elif status == POLL_OK:
             break
@@ -109,10 +107,10 @@ def _cancel(cancel_conn: PGcancelConn) -> PQGenConn[None]:
     while True:
         if (status := cancel_conn.poll()) == POLL_OK:
             break
-        elif status == POLL_READING:
-            yield cancel_conn.socket, WAIT_R
-        elif status == POLL_WRITING:
-            yield cancel_conn.socket, WAIT_W
+        elif status == POLL_READING or status == POLL_WRITING:
+            wait = WAIT_R if status == POLL_READING else WAIT_W
+            while not (yield cancel_conn.socket, wait):
+                pass
         elif status == POLL_FAILED:
             raise e.OperationalError(
                 f"cancellation failed: {cancel_conn.get_error_message()}"

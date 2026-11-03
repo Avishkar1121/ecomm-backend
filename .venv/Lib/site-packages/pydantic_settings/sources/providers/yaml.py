@@ -80,7 +80,11 @@ class YamlConfigSettingsSource(InitSettingsSource, ConfigFileSourceMixin):
 
     def _read_file(self, file_path: Path | Traversable) -> dict[str, Any]:
         import_yaml()
-        with file_path.open(encoding=self.yaml_file_encoding) as yaml_file:
+        # Default to UTF-8 rather than the locale encoding, matching `DotEnvSettingsSource`
+        # and `SecretsSettingsSource`: the YAML spec requires UTF-8/UTF-16, and the locale
+        # default corrupts (or fails to decode) it on a non-UTF-8 Windows code page.
+        encoding = self.yaml_file_encoding if self.yaml_file_encoding is not None else 'utf-8'
+        with file_path.open(encoding=encoding) as yaml_file:
             return yaml.safe_load(yaml_file) or {}
 
     def _traverse_nested_section(
@@ -111,11 +115,11 @@ class YamlConfigSettingsSource(InitSettingsSource, ConfigFileSourceMixin):
             return data[section_path]
         except KeyError:
             pass  # Not a literal key, try splitting
-        except TypeError:
+        except TypeError as e:
             raise TypeError(
                 f'yaml_config_section path "{original_path}" cannot be traversed in {self.yaml_file_path}. '
                 f'An intermediate value is not a dictionary.'
-            )
+            ) from e
 
         # If path contains no dots, we already tried it as a literal key above
         if '.' not in section_path:
@@ -129,13 +133,9 @@ class YamlConfigSettingsSource(InitSettingsSource, ConfigFileSourceMixin):
 
             if prefix in data:
                 # Found the prefix as a literal key, now recursively traverse the suffix
-                try:
-                    return self._traverse_nested_section(data[prefix], suffix, original_path)
-                except TypeError:
-                    raise TypeError(
-                        f'yaml_config_section path "{original_path}" cannot be traversed in {self.yaml_file_path}. '
-                        f'An intermediate value is not a dictionary.'
-                    )
+                # The recursive call already raises a `TypeError` carrying `original_path`,
+                # so let it propagate rather than re-wrapping it in an identical message.
+                return self._traverse_nested_section(data[prefix], suffix, original_path)
 
         # If we get here, no match was found
         raise KeyError(f'yaml_config_section key "{original_path}" not found in {self.yaml_file_path}')

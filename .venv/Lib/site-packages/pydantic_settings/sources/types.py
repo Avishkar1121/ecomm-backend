@@ -2,15 +2,10 @@
 
 from __future__ import annotations as _annotations
 
-import sys
 from collections.abc import Sequence
+from importlib.resources.abc import Traversable as Traversable  # noqa: PLC0414  (explicit re-export)
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-
-if sys.version_info >= (3, 11):
-    from importlib.resources.abc import Traversable as Traversable  # noqa: PLC0414  (explicit re-export)
-else:
-    from importlib.abc import Traversable as Traversable  # noqa: PLC0414  (explicit re-export)
 
 if TYPE_CHECKING:
     from pydantic._internal._dataclasses import PydanticDataclass
@@ -42,12 +37,12 @@ PathType = Path | str | Sequence[Path | str]
 # See https://github.com/pydantic/pydantic-settings/issues/299
 ConfigFileSourceType = Path | str | Traversable | Sequence[Path | str | Traversable]
 DotenvFiltering = Literal['match_prefix', 'only_existing']
-DEFAULT_PATH: PathType = Path('')
+DEFAULT_PATH: PathType = Path()
 
-# This is used as default value for `_env_file` in the `BaseSettings` class and
-# `env_file` in `DotEnvSettingsSource` so the default can be distinguished from `None`.
+# This is used as the default value for `_env_file` in the `BaseSettings` class and
+# `env_file` in `DotEnvSettingsSource` so that the default can be distinguished from `None`.
 # See the docstring of `BaseSettings` for more details.
-ENV_FILE_SENTINEL: DotenvType = Path('')
+ENV_FILE_SENTINEL: DotenvType = Path()
 
 
 class _CliSubCommand:
@@ -55,6 +50,10 @@ class _CliSubCommand:
 
 
 class _CliPositionalArg:
+    pass
+
+
+class _CliVariadicArg:
     pass
 
 
@@ -90,6 +89,7 @@ __all__ = [
     'DEFAULT_PATH',
     'ENV_FILE_SENTINEL',
     'ConfigFileSourceType',
+    'DotenvFiltering',
     'DotenvType',
     'EnvNoneType',
     'EnvPrefixTarget',
@@ -105,4 +105,5 @@ __all__ = [
     '_CliSubCommand',
     '_CliToggleFlag',
     '_CliUnknownArgs',
+    '_CliVariadicArg',
 ]

@@ -1,6 +1,6 @@
 """Package containing individual source implementations."""
 
-from .aws import AWSSecretsManagerSettingsSource
+from .aws import AWSSecretsManagerSettingsSource, AWSSystemsManagerSettingsSource
 from .azure import AzureKeyVaultSettingsSource
 from .cli import (
     CliDualFlag,
@@ -12,6 +12,7 @@ from .cli import (
     CliSubCommand,
     CliSuppress,
     CliToggleFlag,
+    CliVariadicArg,
 )
 from .dotenv import DotEnvSettingsSource
 from .env import EnvSettingsSource
@@ -24,6 +25,7 @@ from .yaml import YamlConfigSettingsSource
 
 __all__ = [
     'AWSSecretsManagerSettingsSource',
+    'AWSSystemsManagerSettingsSource',
     'AzureKeyVaultSettingsSource',
     'CliDualFlag',
     'CliExplicitFlag',
@@ -34,6 +36,7 @@ __all__ = [
     'CliSubCommand',
     'CliSuppress',
     'CliToggleFlag',
+    'CliVariadicArg',
     'DotEnvSettingsSource',
     'EnvSettingsSource',
     'GoogleSecretManagerSettingsSource',

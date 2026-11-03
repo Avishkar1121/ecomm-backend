@@ -2,11 +2,15 @@
 
 from __future__ import annotations as _annotations
 
+import os
 import warnings
 from collections import deque
 from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import is_dataclass
 from enum import Enum
+from itertools import islice
+from pathlib import Path
 from typing import Any, TypedDict, TypeVar, cast, get_args, get_origin
 
 from pydantic import BaseModel, Json, RootModel, Secret
@@ -44,7 +48,7 @@ def _warn_if_field_info_incomplete(field_info: FieldInfo, field_name: str, init_
     if id(field_info) in warned_ids:
         return
     warned_ids.add(id(field_info))
-    warnings.warn(
+    warnings.warn(  # noqa: B028  (called from many sources at differing depths, so no stacklevel is correct)
         f'Field {field_name!r} has an incomplete definition: its annotation contains an unresolved '
         'forward reference, so settings sources may fail to correctly resolve its value. '
         'Call `model_rebuild()` on the model where the field is defined, once all the referenced '
@@ -57,7 +61,7 @@ def _get_env_var_key(key: str, case_sensitive: bool = False) -> str:
     return key if case_sensitive else key.lower()
 
 
-def _parse_env_none_str(value: str | None, parse_none_str: str | None = None) -> str | None | EnvNoneType:
+def _parse_env_none_str(value: str | None, parse_none_str: str | None = None) -> str | EnvNoneType | None:
     return value if not (value == parse_none_str and parse_none_str is not None) else EnvNoneType(value)
 
 
@@ -72,6 +76,25 @@ def parse_env_vars(
         for k, v in env_vars.items()
         if not (ignore_empty and v == '')
     }
+
+
+def _resolve_config_file(file: str | os.PathLike[str], depth: int = 0, *, allow_fifo: bool = False) -> Path | None:
+    """Resolve a config file path, optionally searching parent directories of the cwd."""
+
+    file_path = Path(file).expanduser()
+
+    if file_path.is_file() or (allow_fifo and file_path.is_fifo()):
+        return file_path
+
+    if depth <= 0 or file_path.is_absolute():
+        return None
+
+    for parent in islice(Path.cwd().parents, depth):
+        candidate = parent / file_path
+        if candidate.is_file() or (allow_fifo and candidate.is_fifo()):
+            return candidate
+
+    return None
 
 
 def _substitute_typevars(tp: Any, param_map: dict[Any, Any]) -> Any:
@@ -95,22 +118,33 @@ def _substitute_typevars(tp: Any, param_map: dict[Any, Any]) -> Any:
             import operator
 
             return functools.reduce(operator.or_, new_args)
-    return tp
+    # Unreachable in practice: an annotation with args always has an origin.
+    # Kept as a defensive fallback.
+    return tp  # pragma: no cover
 
 
 def _resolve_type_alias(annotation: Any) -> Any:
-    """Resolve a TypeAliasType to its underlying value, substituting type params if parameterized."""
-    if typing_objects.is_typealiastype(annotation):
-        return annotation.__value__
-    origin = get_origin(annotation)
-    if typing_objects.is_typealiastype(origin):
+    """Resolve a TypeAliasType to its underlying value, substituting type params if parameterized.
+
+    Aliases of aliases are followed until a non-alias annotation is reached. This terminates because
+    pydantic rejects aliases that circularly refer to themselves without going through another type.
+    """
+    while True:
+        if typing_objects.is_typealiastype(annotation):
+            annotation = annotation.__value__
+            continue
+        origin = get_origin(annotation)
+        if not typing_objects.is_typealiastype(origin):
+            return annotation
         type_params = getattr(origin, '__type_params__', ())
         type_args = get_args(annotation)
-        value = origin.__value__
-        if type_params and type_args:
-            return _substitute_typevars(value, dict(zip(type_params, type_args)))
-        return value
-    return annotation
+        annotation = origin.__value__
+        # Always true in practice: only a subscripted alias reaches here, and subscripting
+        # requires type params.
+        if type_params and type_args:  # pragma: no branch
+            # Not `strict=True`: a parameterized alias may supply fewer args than
+            # params (e.g. type params with defaults), which is valid.
+            annotation = _substitute_typevars(annotation, dict(zip(type_params, type_args, strict=False)))
 
 
 def _annotation_is_complex(annotation: Any, metadata: list[Any], init_state: InitState | None = None) -> bool:
@@ -148,14 +182,23 @@ def _annotation_is_complex(annotation: Any, metadata: list[Any], init_state: Ini
     )
 
 
-def _get_field_metadata(field: FieldInfo) -> list[Any]:
+def _get_field_annotation_and_metadata(field: FieldInfo) -> tuple[Any, list[Any]]:
+    """Resolve a field's type alias and collect its outer Annotated metadata."""
     annotation = _resolve_type_alias(field.annotation)
     metadata = field.metadata
     origin = get_origin(annotation)
     if typing_objects.is_annotated(origin):
-        _, *meta = get_args(annotation)
-        metadata += meta
-    return metadata
+        annotation, *meta = get_args(annotation)
+        # Build a new list rather than extending in place: `field.metadata` is shared
+        # across instantiations, subclasses and rebuilds, so mutating it would append
+        # the alias metadata again on every call.
+        metadata = [*metadata, *meta]
+    return annotation, metadata
+
+
+def _get_field_metadata(field: FieldInfo) -> list[Any]:
+    """Collect a field's metadata, including the outer Annotated metadata of its type alias."""
+    return _get_field_annotation_and_metadata(field)[1]
 
 
 def _annotation_is_complex_inner(annotation: type[Any] | None) -> bool:
@@ -163,27 +206,46 @@ def _annotation_is_complex_inner(annotation: type[Any] | None) -> bool:
         return False
 
     return _lenient_issubclass(
-        annotation, (BaseModel, Mapping, Sequence, tuple, set, frozenset, deque)
+        annotation, (BaseModel, Mapping, Sequence, AbstractSet, tuple, set, frozenset, deque)
     ) or is_dataclass(annotation)
 
 
-def _union_is_complex(annotation: type[Any] | None, metadata: list[Any], init_state: InitState | None = None) -> bool:
+def _union_is_complex(
+    annotation: type[Any] | None,
+    metadata: list[Any],
+    init_state: InitState | None = None,
+    _seen: tuple[Any, ...] = (),
+) -> bool:
     """Check if a union type contains any complex types."""
     for arg in get_args(annotation):
+        if arg in _seen:
+            continue
+        # Track the original member: resolving a generic alias rebuilds its union,
+        # but aliases with the same origin and arguments still compare equal.
+        seen = (*_seen, arg)
+        arg = _resolve_type_alias(arg)
         if _annotation_is_complex(arg, metadata, init_state):
             return True
-        # _annotation_is_complex doesn't handle bare Union types, so when an arg
-        # is Annotated[Union[X, Y], ...], stripping Annotated yields a bare Union
-        # that _annotation_is_complex can't evaluate.  Recurse into it, but only
-        # if the Annotated metadata doesn't suppress complexity (e.g. Json).
-        inner = _strip_annotated(arg)
-        if inner is not arg:
-            _, *inner_meta = get_args(arg)
-            if any(isinstance(md, Json) for md in inner_meta):  # type: ignore[misc]
-                continue
-        if is_union_origin(get_origin(inner)) and _union_is_complex(inner, metadata, init_state):
+        # _annotation_is_complex doesn't handle bare Union types, including those
+        # exposed by a type alias or Annotated[Union[X, Y], ...]. Recurse, but only
+        # if no Annotated metadata suppresses complexity (e.g. Json).
+        inner = _unwrap_union_member(arg)
+        if is_union_origin(get_origin(inner)) and _union_is_complex(inner, metadata, init_state, seen):
             return True
     return False
+
+
+def _unwrap_union_member(annotation: Any) -> Any:
+    """Strip Annotated layers and the type aliases they wrap from a union member.
+
+    Returns `None` if any layer's metadata suppresses complexity (e.g. Json).
+    """
+    while typing_objects.is_annotated(get_origin(annotation)):
+        annotation, *meta = get_args(annotation)
+        if any(isinstance(md, Json) for md in meta):  # type: ignore[misc]
+            return None
+        annotation = _resolve_type_alias(annotation)
+    return annotation
 
 
 def _union_has_strict_types(annotation: type[Any] | None) -> bool:
@@ -196,20 +258,49 @@ def _union_has_strict_types(annotation: type[Any] | None) -> bool:
     return False
 
 
+def _is_subtype_of(annotation: Any, types: tuple[Any, ...]) -> bool:
+    """Check if a type annotation is a class that subclasses any of the specified types.
+
+    Text and bytes types never match, since they are sequences themselves, but are treated as
+    scalar values by the settings sources.
+    """
+    return not _lenient_issubclass(annotation, (str, bytes, bytearray)) and _lenient_issubclass(annotation, types)
+
+
 def _annotation_contains_types(
-    annotation: type[Any] | None,
+    annotation: Any,
     types: tuple[Any, ...],
     is_include_origin: bool = True,
     is_strip_annotated: bool = False,
     is_instance: bool = False,
     collect: set[Any] | None = None,
+    is_subtype: bool = False,
+    _seen_aliases: tuple[Any, ...] = (),
 ) -> bool:
-    """Check if a type annotation contains any of the specified types."""
+    """Check if a type annotation contains any of the specified types.
+
+    With `is_subtype`, subclasses of the specified types match as well, so `tuple` matches
+    `Sequence`, or `frozenset` matches `Set`.
+    """
     if is_strip_annotated:
         annotation = _strip_annotated(annotation)
+    resolved = _resolve_type_alias(annotation)
+    if resolved is not annotation:
+        # An alias already on the current path is recursive, so stop there. Only the current path is
+        # tracked, so sibling specializations of the same alias are still inspected.
+        return annotation not in _seen_aliases and _annotation_contains_types(
+            resolved,
+            types,
+            is_include_origin=is_include_origin,
+            is_strip_annotated=is_strip_annotated,
+            is_instance=is_instance,
+            collect=collect,
+            is_subtype=is_subtype,
+            _seen_aliases=(*_seen_aliases, annotation),
+        )
     if is_include_origin is True:
         origin = get_origin(annotation)
-        if origin in types:
+        if origin in types or (is_subtype and _is_subtype_of(origin, types)):
             if collect is None:
                 return True
             collect.add(annotation)
@@ -226,6 +317,8 @@ def _annotation_contains_types(
                 is_strip_annotated=is_strip_annotated,
                 is_instance=is_instance,
                 collect=collect,
+                is_subtype=is_subtype,
+                _seen_aliases=_seen_aliases,
             )
             and collect is None
         ):
@@ -234,21 +327,33 @@ def _annotation_contains_types(
         if collect is None:
             return True
         collect.add(annotation)
-    if annotation in types:
+    if annotation in types or (is_subtype and _is_subtype_of(annotation, types)):
         if collect is not None:
             collect.add(annotation)
         return True
     return False
 
 
+def _get_union_members(annotation: Any) -> tuple[Any, ...]:
+    """Get the members of a union, flattening unions nested inside type aliases or `Annotated`.
+
+    A non-union annotation is returned as its only member.
+    """
+    resolved = _strip_annotated(_resolve_type_alias(_strip_annotated(annotation)))
+    if resolved is not annotation:
+        return _get_union_members(resolved)
+    if not is_union_origin(get_origin(annotation)):
+        return (annotation,)
+    return tuple(member for arg in get_args(annotation) for member in _get_union_members(arg))
+
+
 def _strip_annotated(annotation: Any) -> Any:
     if typing_objects.is_annotated(get_origin(annotation)):
         return annotation.__origin__
-    else:
-        return annotation
+    return annotation
 
 
-def _annotation_enum_val_to_name(annotation: type[Any] | None, value: Any) -> str | None:
+def _annotation_enum_val_to_name(annotation: Any, value: Any) -> str | None:
     for type_ in (annotation, get_origin(annotation)):
         if _lenient_issubclass(type_, Enum):
             enum_type = cast('type[Enum]', type_)
@@ -261,7 +366,7 @@ def _annotation_enum_val_to_name(annotation: type[Any] | None, value: Any) -> st
     return None
 
 
-def _annotation_enum_name_to_val(annotation: type[Any] | None, name: Any) -> Any:
+def _annotation_enum_name_to_val(annotation: Any, name: Any) -> Any:
     for type_ in (annotation, get_origin(annotation)):
         if _lenient_issubclass(type_, Enum):
             enum_type = cast('type[Enum]', type_)
@@ -304,32 +409,38 @@ def _get_alias_names(
     alias_path_args: dict[str, int | None] | None = None,
     case_sensitive: bool = True,
     populate_by_name: bool = False,
+    validate_by_alias: bool = True,
 ) -> tuple[tuple[str, ...], bool]:
-    """Get alias names for a field, handling alias paths and case sensitivity."""
+    """Get alias names for a field, handling alias paths and case sensitivity.
+
+    With `validate_by_alias=False` pydantic ignores the aliases, so only the field name is returned.
+
+    The first name is the key that sources pass the value to pydantic under.
+    """
     from pydantic import AliasChoices, AliasPath
 
     alias_names: list[str] = []
     is_alias_path_only: bool = True
-    if not any((field_info.alias, field_info.validation_alias)):
+    if not validate_by_alias or not any((field_info.alias, field_info.validation_alias)):
         alias_names += [field_name]
         is_alias_path_only = False
     else:
         new_alias_paths: list[AliasPath] = []
-        for alias in (field_info.alias, field_info.validation_alias):
-            if alias is None:
-                continue
-            elif isinstance(alias, str):
-                alias_names.append(alias)
-                is_alias_path_only = False
-            elif isinstance(alias, AliasChoices):
-                for name in alias.choices:
-                    if isinstance(name, str):
-                        alias_names.append(name)
-                        is_alias_path_only = False
-                    else:
-                        new_alias_paths.append(name)
-            else:
-                new_alias_paths.append(alias)
+        # Pydantic only validates input against `validation_alias` when it is set, so `alias` isn't an input name then
+        alias = field_info.validation_alias if field_info.validation_alias is not None else field_info.alias
+        if isinstance(alias, str):
+            alias_names.append(alias)
+            is_alias_path_only = False
+        elif isinstance(alias, AliasChoices):
+            for name in alias.choices:
+                if isinstance(name, str):
+                    alias_names.append(name)
+                    is_alias_path_only = False
+                else:
+                    new_alias_paths.append(name)
+        else:
+            # Can't be `None`, the check above ensures one of the aliases is set
+            new_alias_paths.append(cast(AliasPath, alias))
         for alias_path in new_alias_paths:
             name = cast(str, alias_path.path[0])
             name = name.lower() if not case_sensitive else name
@@ -345,6 +456,32 @@ def _get_alias_names(
     if not case_sensitive:
         alias_names = [alias_name.lower() for alias_name in alias_names]
     return tuple(dict.fromkeys(alias_names)), is_alias_path_only
+
+
+def _get_model_config(model: Any) -> Mapping[str, Any]:
+    """Get the config of a pydantic model or pydantic dataclass."""
+    return getattr(model, 'model_config', None) or getattr(model, '__pydantic_config__', {})
+
+
+def _validate_by_alias_enabled(config: Mapping[str, Any]) -> bool:
+    """Whether fields can be populated by their aliases. pydantic defaults `validate_by_alias` to True."""
+    return config.get('validate_by_alias') is not False
+
+
+def _validate_by_name_enabled(config: Mapping[str, Any]) -> bool:
+    """Whether fields can be populated by their name, resolved the same way pydantic resolves its config.
+
+    pydantic < 2.14 wrote the resolved `validate_by_name` back into `model_config`, but newer versions leave
+    `model_config` as declared, so the `populate_by_name` fallback and the `validate_by_alias=False` implication
+    have to be applied here.
+    """
+    validate_by_name = config.get('validate_by_name')
+    if validate_by_name is not None:
+        return validate_by_name
+    populate_by_name = config.get('populate_by_name')
+    if populate_by_name is not None:
+        return populate_by_name
+    return config.get('validate_by_alias') is False
 
 
 def _is_function(obj: Any) -> bool:
@@ -364,9 +501,11 @@ __all__ = [
     '_get_alias_names',
     '_get_env_var_key',
     '_get_model_fields',
+    '_get_union_members',
     '_is_function',
     '_literal_has_numeric_enum',
     '_parse_env_none_str',
+    '_resolve_config_file',
     '_resolve_type_alias',
     '_strip_annotated',
     '_union_has_strict_types',
