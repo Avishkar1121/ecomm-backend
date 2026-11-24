@@ -9,3 +9,4 @@ pyjwt>=2.8
 python-multipart>=0.0.9
 phonenumbers>=8.13
 pytest>=8.0
+httpx2>=2.0
