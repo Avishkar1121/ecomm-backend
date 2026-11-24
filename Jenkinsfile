@@ -10,12 +10,29 @@ pipeline {
             }
         }
 
-        stage('Verify Project') {
+        stage('Python Version') {
             steps {
-                bat 'echo === Project Files ==='
-                bat 'dir'
-                bat 'echo === Python Version ==='
                 bat 'python --version'
+                bat 'python -m pip --version'
+            }
+        }
+
+        stage('Create Virtual Environment') {
+            steps {
+                bat 'python -m venv .venv'
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                bat '.venv\\Scripts\\python.exe -m pip install --upgrade pip'
+                bat '.venv\\Scripts\\python.exe -m pip install -r requirements.txt'
+            }
+        }
+
+        stage('Run Tests') {
+            steps {
+                bat '.venv\\Scripts\\python.exe -m pytest -q'
             }
         }
     }
