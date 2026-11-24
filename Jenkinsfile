@@ -2,24 +2,27 @@
 pipeline {
     agent any
 
+    environment {
+        PYTHON = 'C:\\Users\\Avishkar\\AppData\\Local\\Programs\\Python\\Python311\\python.exe'
+    }
+
     stages {
         stage('Checkout') {
             steps {
-                checkout scm
-                echo 'GitHub source code downloaded successfully!'
+                echo 'GitHub checkout completed successfully!'
             }
         }
 
         stage('Python Version') {
             steps {
-                bat 'python --version'
-                bat 'python -m pip --version'
+                bat '"%PYTHON%" --version'
+                bat '"%PYTHON%" -m pip --version'
             }
         }
 
         stage('Create Virtual Environment') {
             steps {
-                bat 'python -m venv .venv'
+                bat '"%PYTHON%" -m venv .venv'
             }
         }
 
