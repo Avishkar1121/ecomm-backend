@@ -8,3 +8,4 @@ argon2-cffi>=23.1
 pyjwt>=2.8
 python-multipart>=0.0.9
 phonenumbers>=8.13
+pytest>=8.0
