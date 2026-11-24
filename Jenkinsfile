@@ -35,7 +35,12 @@ pipeline {
 
         stage('Run Tests') {
             steps {
-                bat '.venv\\Scripts\\python.exe -m pytest -q'
+                withCredentials([string(
+                    credentialsId: 'DATABASE_URL',
+                    variable: 'DATABASE_URL'
+                )]) {
+                    bat '.venv\\Scripts\\python.exe -m pytest -q'
+                }
             }
         }
     }
